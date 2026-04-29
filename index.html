@@ -115,14 +115,15 @@
 
         if (cmd === "!reroll") {
             if (voices.length === 0) return;
-            const newIndex = Math.floor(Math.random() * voices.length);
+            const maxVoice = Math.min(39, voices.length - 1);
+            const newIndex = Math.floor(Math.random() * (maxVoice + 1));
             set(ref(db, 'userVoices/' + user.toLowerCase()), { voiceIndex: newIndex });
             return;
         }
 
         if (cmd === "!setvoice") {
             const index = parseInt(parts[1]);
-            if (!isNaN(index) && index >= 0 && index < voices.length) {
+            if (!isNaN(index) && index >= 0 && index <= 39 && index < voices.length) {
                 set(ref(db, 'userVoices/' + user.toLowerCase()), { voiceIndex: index });
             }
             return;
