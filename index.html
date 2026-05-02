@@ -38,7 +38,7 @@
     let VOICE_SETTING = "random"; 
     const FIXED_VOICE_NAME = "Google US English";
     const USER_BLACKLIST = ["streamelements", "nightbot", "botrix", "kicktools", "kickbot", "growopgame", "missxss", "botrixoficial", "BotRixOficial", "techbots", "Str8SavageBot"]; 
-    const WORD_BLACKLIST = ["http", ".com", ".net", ".org", "mariatrip", ]; 
+    const WORD_BLACKLIST = ["http", ".com", ".net", ".org", "mariatrip"]; 
     const PREFIX_BLOCK = ["!", "/"]; 
 
     let voices = [];
@@ -112,7 +112,7 @@
     function handleCommands(user, msg, isMod) {
         const parts = msg.trim().split(" ");
         const cmd = parts[0].toLowerCase();
-
+        
         if (cmd === "!reroll") {
             if (voices.length === 0) return;
             const maxVoice = Math.min(39, voices.length - 1);
