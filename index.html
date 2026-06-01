@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>TTS Master Overlay</title>
+    <script src="https://js.pusher.com/8.3.0/pusher.min.js"></script>
+    <style>
+        body { background: transparent; overflow: hidden; margin: 0; padding: 0; }
+        #status-msg { position: fixed; top: 10px; left: 10px; color: white; font-family: sans-serif; font-size: 11px; text-shadow: 1px 1px black; opacity: 0.4; }
+    </style>
+</head>
+<body>
+
+<script type="module">
+    // --- FIREBASE SETUP ---
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-app.js";
+    import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/11.0.1/firebase-database.js";
+
+    const firebaseConfig = {
+    apiKey: "AIzaSyB-kQk-OrOFGYDheB5lWpo0bR9Kdji9i0w",
+    authDomain: "savage-tts.firebaseapp.com",
+    databaseURL: "https://savage-tts-default-rtdb.firebaseio.com/",
+    projectId: "savage-tts",
+    storageBucket: "savage-tts.firebasestorage.app",
+    messagingSenderId: "1090977397843",
+    appId: "1:1090977397843:web:53aa2e215f9df78eb71aa6",
+    measurementId: "G-95W6L4MH1X"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    // --- CONFIGURATION ---
+    const KICK_CHATROOM_ID = "1085080"; 
+    const TWITCH_CHANNEL = "";
+    const TWITCH_OAUTH = "";
+
+    let VOICE_SETTING = "random"; 
+    const FIXED_VOICE_NAME = "Google US English";
+    const USER_BLACKLIST = ["streamelements", "nightbot", "botrix", "kicktools", "kickbot", "growopgame", "missxss", "botrixoficial", "BotRixOficial", "techbots", "Str8SavageBot"]; 
+    const WORD_BLACKLIST = ["http", ".com", ".net", ".org", "mariatrip"]; 
+    const PREFIX_BLOCK = ["!", "/"]; 
+
+    let voices = [];
+    let userVoicePrefs = {}; 
+    let lastProcessedMessages = new Map();
+    let ttsEnabled = true; 
+    let subOnlyMode = false;
+    let readNames = false;
+    let speechQueue = [];
+    let isSpeaking = false;
+    let synth = window.speechSynthesis;
+
+    onValue(ref(db, 'userVoices'), (snapshot) => {
+        userVoicePrefs = snapshot.val() || {};
+    });
+
+    function loadVoices() { 
+        let availableVoices = synth.getVoices();
+        console.log(`[TTS] Voices available: ${availableVoices.length}`);
+        if (availableVoices.length === 0) { 
+            console.warn(`[TTS] No voices found!`);
+            return; 
+        }
+        voices = availableVoices.filter(v => v.lang.includes('en')); 
+        if (voices.length === 0) voices = availableVoices;
+        console.log(`[TTS] Using ${voices.length} voices (${voices[0]?.name})`);
+        updateStatusUI();
+    }
+    
+    synth.onvoiceschanged = loadVoices;
+    loadVoices();
+    setTimeout(loadVoices, 2000);
+
+    function updateStatusUI() {
+        const el = document.getElementById('status-msg');
+        if(!el) return;
+        el.innerText = `TTS: ${ttsEnabled ? 'ON' : 'OFF'} | Mode: ${subOnlyMode ? "SUBS" : "ALL"} | Names: ${readNames ? "ON" : "OFF"} | Voices: ${voices.length}`;
+        el.style.color = ttsEnabled ? '#53fc18' : '#ff4b4b';
+    }
+
+    // --- MESSAGE HANDLERS (KICK & TWITCH) ---
+    const pusher = new Pusher('32cbd69e4b950bf97679', { cluster: 'us2', forceTLS: true });
+    const kickChannel = pusher.subscribe(`chatrooms.${KICK_CHATROOM_ID}.v2`);
+    kickChannel.bind('App\\Events\\ChatMessageEvent', (data) => {
+        const chat = typeof data === 'string' ? JSON.parse(data) : data;
+        const isMod = chat.sender.identity.badges.some(b => b.type === 'moderator' || b.type === 'broadcaster');
+        const isSub = chat.sender.identity.badges.some(b => b.type === 'subscriber' || b.type === 'founder' || b.type === 'og');
+        handleCommands(chat.sender.username, chat.content, isMod);
+        processAndSpeak(chat.sender.username, chat.content, isMod, isSub, true);
+    });
+
+    function connectTwitch() {
+        const socket = new WebSocket('wss://irc-ws.chat.twitch.tv:443');
+        socket.onopen = () => {
+            socket.send('CAP REQ :twitch.tv/tags twitch.tv/commands');
+            socket.send(`PASS ${TWITCH_OAUTH}`);
+            socket.send(`NICK ${TWITCH_CHANNEL}`);
+            socket.send(`JOIN #${TWITCH_CHANNEL}`);
+        };
+        socket.onmessage = (event) => {
+            const raw = event.data.trim();
+            if (raw.startsWith('PING')) { socket.send('PONG :tmi.twitch.tv'); return; }
+            if (!raw.includes('PRIVMSG')) return;
+            const userMatch = raw.match(/:([^!]+)!/);
+            const user = userMatch ? userMatch[1] : "User";
+            const parts = raw.split(' PRIVMSG #' + TWITCH_CHANNEL + ' :');
+            if (parts.length < 2) return;
+            let message = parts[1].trim();
+            const isMod = raw.includes('mod=1') || raw.includes('badges=broadcaster');
+            const isSub = raw.includes('subscriber=1') || raw.includes('founder/1');
+            handleCommands(user, message, isMod);
+            processAndSpeak(user, message, isMod, isSub, false);
+        };
+        socket.onclose = () => setTimeout(connectTwitch, 5000);
+    }
+    connectTwitch();
+
+    // --- COMMANDS ---
+    function handleCommands(user, msg, isMod) {
+        const parts = msg.trim().split(" ");
+        const cmd = parts[0].toLowerCase();
+        
+        if (cmd === "!reroll") {
+            if (voices.length === 0) return;
+            const maxVoice = Math.min(39, voices.length - 1);
+            const newIndex = Math.floor(Math.random() * (maxVoice + 1));
+            set(ref(db, 'userVoices/' + user.toLowerCase()), { voiceIndex: newIndex });
+            return;
+        }
+
+        if (cmd === "!setvoice") {
+            const index = parseInt(parts[1]);
+            if (!isNaN(index) && index >= 0 && index <= 39 && index < voices.length) {
+                set(ref(db, 'userVoices/' + user.toLowerCase()), { voiceIndex: index });
+            }
+            return;
+        }
+
+        if (!isMod) return;
+        if (cmd === "!ttsoff") { 
+            ttsEnabled = false; 
+            synth.cancel(); 
+            speechQueue = []; 
+            isSpeaking = false; 
+            updateStatusUI(); 
+            console.log(`[TTS] TTS turned OFF`);
+        }
+        else if (cmd === "!ttson") { 
+            ttsEnabled = true; 
+            updateStatusUI(); 
+            console.log(`[TTS] TTS turned ON`);
+        }
+        else if (cmd === "!subson") { subOnlyMode = true; updateStatusUI(); }
+        else if (cmd === "!subsoff") { subOnlyMode = false; updateStatusUI(); }
+        else if (cmd === "!namesoff") { readNames = false; updateStatusUI(); }
+        else if (cmd === "!nameson") { readNames = true; updateStatusUI(); }
+        else if (cmd === "!ttsreset") { 
+            synth.cancel(); 
+            speechQueue = []; 
+            isSpeaking = false; 
+            console.log(`[TTS] Queue cleared and speech cancelled`); 
+        }
+    }
+
+    // --- SPAM FILTERED PROCESSING ---
+    function processAndSpeak(user, raw, isMod, isSub, isKick) {
+        console.log(`[TTS DEBUG] Message received from ${user}: "${raw}" | isMod: ${isMod} | isSub: ${isSub} | isKick: ${isKick}`);
+        
+        if (!ttsEnabled) { 
+            console.log(`[TTS] Skipped - TTS disabled`);
+            return; 
+        }
+        if (subOnlyMode && !isMod && !isSub) { 
+            console.log(`[TTS] Skipped - Sub only mode and user is not sub/mod`);
+            return;
+        }
+        if (USER_BLACKLIST.map(u => u.toLowerCase()).includes(user.toLowerCase())) { 
+            console.log(`[TTS] Skipped blacklisted user: ${user}`);
+            return; 
+        }
+        if (PREFIX_BLOCK.some(p => raw.trim().startsWith(p))) { 
+            console.log(`[TTS] Skipped - message starts with prefix: ${raw}`);
+            return; 
+        }
+        
+        // Changed: Track duplicates per-user, not globally
+        const lowerUser = user.toLowerCase();
+        if (raw === lastProcessedMessages.get(lowerUser)) { 
+            console.log(`[TTS] Skipped duplicate from ${user}: ${raw}`);
+            return; 
+        }
+        lastProcessedMessages.set(lowerUser, raw);
+
+        let clean = raw;
+        if (isKick) { clean = clean.replace(/\[emote:\d+:[^\]]+\]/g, ''); }
+        console.log(`[TTS DEBUG] After emote removal: "${clean}"`);
+
+        // Remove special characters
+        clean = clean.replace(/[^\w\s?.!,\$]/g, '').replace(/\s+/g, ' ');
+        console.log(`[TTS DEBUG] After char filtering: "${clean}"`);
+
+        // --- ANTI-SPAM LOGIC ---
+        // 1. Reduce repeating characters (e.g., "77777" -> "777", "hiiiii" -> "hiii")
+        clean = clean.replace(/(.)\1{3,}/gi, '$1$1$1');
+
+        // 2. Character limit (don't let someone send a whole novel)
+        if (clean.length > 250) clean = clean.substring(0, 250);
+
+        clean = clean.trim();
+        console.log(`[TTS DEBUG] After cleanup: "${clean}" (length: ${clean.length})`);
+
+        if (WORD_BLACKLIST.some(word => clean.toLowerCase().includes(word.toLowerCase()))) { 
+            console.log(`[TTS] Skipped - word blacklist match in: ${clean}`);
+            return; 
+        }
+        if (/[a-zA-Z0-9]/.test(clean) === false) { 
+            console.log(`[TTS] Skipped - no alphanumeric chars in: ${clean}`);
+            return; 
+        }
+
+        console.log(`[TTS] ✓ Reading from ${user}: ${clean}`);
+        speak(user, clean);
+    }
+
+    function speak(user, text) {
+        const finalPhrase = readNames ? `${user} says: ${text}` : text;
+        
+        // Add to queue instead of speaking immediately
+        speechQueue.push({ user, finalPhrase });
+        console.log(`[TTS] Added to queue: "${finalPhrase}" (Queue size: ${speechQueue.length})`);
+        
+        // Process queue if not currently speaking
+        processQueue();
+    }
+
+    function processQueue() {
+        if (isSpeaking || speechQueue.length === 0) {
+            return;
+        }
+        
+        const { user, finalPhrase } = speechQueue.shift();
+        isSpeaking = true;
+        
+        setTimeout(() => {
+            try {
+                // Check if synth is ready
+                if (!synth) {
+                    console.error(`[TTS] Speech Synthesis not available!`);
+                    isSpeaking = false;
+                    setTimeout(processQueue, 300);
+                    return;
+                }
+                
+                const speech = new SpeechSynthesisUtterance(finalPhrase);
+                
+                // Set voice BEFORE speaking
+                if (voices && voices.length > 0) {
+                    const lowerUser = user.toLowerCase();
+                    let voiceIndex = 0;
+                    
+                    if (userVoicePrefs[lowerUser] && userVoicePrefs[lowerUser].voiceIndex !== undefined) {
+                        voiceIndex = userVoicePrefs[lowerUser].voiceIndex;
+                    } else {
+                        // Hash-based voice selection
+                        let hash = 0;
+                        for (let i = 0; i < user.length; i++) {
+                            hash = user.charCodeAt(i) + ((hash << 5) - hash);
+                        }
+                        voiceIndex = Math.abs(hash) % voices.length;
+                    }
+                    
+                    if (voices[voiceIndex]) {
+                        speech.voice = voices[voiceIndex];
+                        console.log(`[TTS] Voice: ${voices[voiceIndex].name}`);
+                    }
+                } else {
+                    console.warn(`[TTS] No voices loaded yet`);
+                }
+                
+                speech.rate = 1.0;
+                speech.pitch = 1.0;
+                speech.volume = 1.0;
+                speech.lang = 'en-US';
+                
+                let eventFired = false;
+                
+                speech.onstart = () => {
+                    eventFired = true;
+                    console.log(`[TTS] ▶ STARTED: "${finalPhrase}"`);
+                };
+                
+                speech.onend = () => {
+                    console.log(`[TTS] ◼ ENDED: "${finalPhrase}"`);
+                    isSpeaking = false;
+                    // Don't cancel, just wait
+                    setTimeout(processQueue, 250);
+                };
+                
+                speech.onerror = (event) => {
+                    console.error(`[TTS] ✗ ERROR (${event.error}): "${finalPhrase}"`);
+                    eventFired = true; // Treat error as event fired
+                    isSpeaking = false;
+                    // Clear and wait longer before retrying
+                    speechQueue = [];
+                    setTimeout(processQueue, 2000);
+                };
+                
+                console.log(`[TTS] Queuing: "${finalPhrase}" (${speechQueue.length} pending)`);
+                synth.speak(speech);
+                
+                // Failsafe timeout
+                setTimeout(() => {
+                    if (!eventFired && isSpeaking) {
+                        console.warn(`[TTS] WARNING: No onstart event after 3s, skipping`);
+                        isSpeaking = false;
+                        // Don't cancel, just move on
+                        setTimeout(processQueue, 300);
+                    }
+                }, 3000);
+                
+            } catch (err) {
+                console.error(`[TTS] EXCEPTION: ${err.message}`);
+                isSpeaking = false;
+                setTimeout(processQueue, 500);
+            }
+        }, 150);
+    }
+
+    setInterval(() => {
+        if (!synth.speaking) {
+            const beat = new SpeechSynthesisUtterance("");
+            beat.volume = 0;
+            synth.speak(beat);
+        }
+    }, 15000);
+</script>
+</body>
+</html>
